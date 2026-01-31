@@ -19,13 +19,22 @@ export default async function handler(req) {
     return new Response('Method Not Allowed', { status: 405 });
   }
 
+  // Handle Authentication
+  const authHeader = req.headers.get('Authorization');
+  if (!authHeader || authHeader !== 'Bearer sh-123456') {
+    return new Response(JSON.stringify({ error: { message: "Invalid API Key", type: "invalid_request_error", param: null, code: "invalid_api_key" } }), {
+      status: 401,
+      headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+    });
+  }
+
   try {
     const body = await req.json();
     const messages = body.messages || [];
     // Extract the last user message
     const lastMessage = messages.length > 0 ? messages[messages.length - 1].content : '';
     const stream = body.stream !== false; // Default to true if not specified, or respect input
-    const model = body.model || 'gpt-3.5-turbo';
+    const model = 'qwen-chat'; // Force model to qwen-chat
 
     const upstreamResponse = await fetch('https://www.couragesteak.com/csgpt', {
       method: 'POST',
