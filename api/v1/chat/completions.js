@@ -1,0 +1,198 @@
+export const config = {
+  runtime: 'edge',
+};
+
+export default async function handler(req) {
+  // Handle CORS
+  if (req.method === 'OPTIONS') {
+    return new Response(null, {
+      status: 200,
+      headers: {
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+        'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+      },
+    });
+  }
+
+  if (req.method !== 'POST') {
+    return new Response('Method Not Allowed', { status: 405 });
+  }
+
+  try {
+    const body = await req.json();
+    const messages = body.messages || [];
+    // Extract the last user message
+    const lastMessage = messages.length > 0 ? messages[messages.length - 1].content : '';
+    const stream = body.stream !== false; // Default to true if not specified, or respect input
+    const model = body.model || 'gpt-3.5-turbo';
+
+    const upstreamResponse = await fetch('https://www.couragesteak.com/csgpt', {
+      method: 'POST',
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36",
+        "Connection": "keep-alive",
+        "Accept": "*/*",
+        "Accept-Encoding": "gzip, deflate, br, zstd",
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        message: lastMessage,
+        scene_type: "cs_assistant"
+      })
+    });
+
+    if (!upstreamResponse.ok) {
+      return new Response(`Upstream Error: ${upstreamResponse.statusText}`, { status: upstreamResponse.status });
+    }
+
+    if (stream) {
+      const encoder = new TextEncoder();
+      const decoder = new TextDecoder();
+      
+      const readable = new ReadableStream({
+        async start(controller) {
+          const reader = upstreamResponse.body.getReader();
+          let buffer = '';
+
+          try {
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              
+              buffer += decoder.decode(value, { stream: true });
+              // Split by newline or closing brace if closely packed
+              // The example shows line-delimited JSON. We will assume that.
+              const lines = buffer.split('\n');
+              buffer = lines.pop(); // Keep the last possibly incomplete line
+
+              for (const line of lines) {
+                const trimmedLine = line.trim();
+                if (!trimmedLine) continue;
+                
+                try {
+                  const data = JSON.parse(trimmedLine);
+                  const content = data.content || '';
+                  
+                  // Construct OpenAI chunk
+                  const chunk = {
+                    id: 'chatcmpl-' + Date.now(),
+                    object: 'chat.completion.chunk',
+                    created: Math.floor(Date.now() / 1000),
+                    model: model,
+                    choices: [{
+                      index: 0,
+                      delta: { content: content },
+                      finish_reason: data.finish_reason || null
+                    }]
+                  };
+                  
+                  controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+                } catch (e) {
+                  // If line is not valid JSON, ignore or log
+                  // console.error('JSON Parse Error:', e);
+                }
+              }
+            }
+            
+            // Process remaining buffer
+            if (buffer.trim()) {
+                try {
+                    const data = JSON.parse(buffer.trim());
+                    const chunk = {
+                        id: 'chatcmpl-' + Date.now(),
+                        object: 'chat.completion.chunk',
+                        created: Math.floor(Date.now() / 1000),
+                        model: model,
+                        choices: [{
+                          index: 0,
+                          delta: { content: data.content || '' },
+                          finish_reason: data.finish_reason || null
+                        }]
+                    };
+                    controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+                } catch(e) {}
+            }
+
+            // Send final chunk with finish_reason: stop
+            const finalChunk = {
+                id: 'chatcmpl-' + Date.now(),
+                object: 'chat.completion.chunk',
+                created: Math.floor(Date.now() / 1000),
+                model: model,
+                choices: [{
+                  index: 0,
+                  delta: {},
+                  finish_reason: 'stop'
+                }]
+            };
+            controller.enqueue(encoder.encode(`data: ${JSON.stringify(finalChunk)}\n\n`));
+
+            controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+            controller.close();
+          } catch (e) {
+            controller.error(e);
+          }
+        }
+      });
+
+      return new Response(readable, {
+        headers: {
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-cache',
+          'Connection': 'keep-alive',
+          'Access-Control-Allow-Origin': '*',
+        }
+      });
+
+    } else {
+      // Non-streaming mode
+      const text = await upstreamResponse.text();
+      const lines = text.split('\n');
+      let fullContent = '';
+      let finishReason = 'stop';
+
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        try {
+          const data = JSON.parse(line);
+          fullContent += data.content || '';
+          if (data.finish_reason) finishReason = data.finish_reason;
+        } catch (e) {}
+      }
+
+      const response = {
+        id: 'chatcmpl-' + Date.now(),
+        object: 'chat.completion',
+        created: Math.floor(Date.now() / 1000),
+        model: model,
+        choices: [{
+          index: 0,
+          message: {
+            role: 'assistant',
+            content: fullContent
+          },
+          finish_reason: finishReason
+        }],
+        usage: {
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: 0
+        }
+      };
+
+      return new Response(JSON.stringify(response), {
+        headers: {
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*',
+        }
+      });
+    }
+
+  } catch (error) {
+    return new Response(JSON.stringify({ error: error.message }), { 
+        status: 500,
+        headers: { 'Content-Type': 'application/json' }
+    });
+  }
+}
